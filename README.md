@@ -1,4 +1,4 @@
-# Inkling 2 Mini (NVFP4) on one NVIDIA DGX Spark: vLLM (DSpark or DFlash2) and TensorFold, up to 1M context
+# Inkling 2 Mini (NVFP4) on one NVIDIA DGX Spark: vLLM and TensorFold, DSpark or DFlash2, up to 1M context
 
 A tested recipe for serving [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on a single DGX Spark (GB10) with the official vLLM image, DSpark speculative decoding and three launch tiers: the vLLM recipe's 262K setup, and two 1,048,576-token (full 1M) setups, one with BF16 KV and one with FP8 KV.
 
@@ -18,6 +18,8 @@ Unofficial community recipe. Not affiliated with Thinking Machines Lab, vLLM or 
 >
 > Chart: [`results/inkling_dflash2_spark.png`](results/inkling_dflash2_spark.png). Details: [DFlash2 section](#dflash2-drafter-patch-results-caveats).
 
+> **New (2026-11-24, later): DFlash2 inside TensorFold.** Patch [`tensorfold/patches/0018-mini-dflash2-drafter.patch`](tensorfold/patches/0018-mini-dflash2-drafter.patch) adds the DFlash2 drafter to TensorFold's Inkling 2 Mini CUDA engine, on top of Mia's AI Lab recipe. Greedy output stays exact (drafted = undrafted). One user, mean of 8 prompt types: **105.5 tok/s** (TensorFold DSpark 68.2, vLLM DFlash2 88.2). At 6 users: 191 tok/s (vLLM DFlash2 227). Prefill and TTFT stay TensorFold's. Details: [TensorFold + DFlash2](#tensorfold--dflash2-our-patch-0018), chart: [`results/tf_dflash2_spark.png`](results/tf_dflash2_spark.png).
+>
 > **Also measured (2026-11-24): a TensorFold lane**, using [Mia's AI Lab TensorFold recipe](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold) through the same bench. TensorFold is ahead on prefill (14-24% faster) and time to first token (1.2 s vs 3.6 s at 3 users). vLLM + DFlash2 is ahead on decode (88 vs 68 tok/s for one user, 227 vs 148 at 6 users). Details: [TensorFold lane](#tensorfold-lane-mias-ai-lab-recipe), chart: [`results/inkling_vllm_vs_tensorfold_spark.png`](results/inkling_vllm_vs_tensorfold_spark.png).
 
 Measured on one Spark on 2026-11-20 and 2026-11-21:
@@ -441,7 +443,7 @@ k=7 at one user (156.5 and 150.4 vs 179.8 tok/s).
 
 ## TensorFold lane (Mia's AI Lab recipe)
 
-Added 2026-11-24. The same model on [TensorFold](https://github.com/ashhart/TensorFold), with Jürgen Schmied's Inkling 2 Mini CUDA engine ([PR #4441](https://github.com/ashhart/TensorFold/pull/4441)) and the 17 patches of **[MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold)** (Apache 2.0). Her patches add the CUDA DSpark drafter, an FP8 KV cache, FP8 attention projections, Blackwell FP4/MXFP8 tensor-core prefill, vision, structured output and vLLM-style `reasoning_effort`. All of the TensorFold engineering here is hers and the TensorFold contributors'. This repo adds only the run settings we used and a head-to-head with the vLLM lanes. TensorFold's CUDA engine does not run the DFlash2 drafter yet.
+Added 2026-11-24. The same model on [TensorFold](https://github.com/ashhart/TensorFold), with Jürgen Schmied's Inkling 2 Mini CUDA engine ([PR #4441](https://github.com/ashhart/TensorFold/pull/4441)) and the 17 patches of **[MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold)** (Apache 2.0). Her patches add the CUDA DSpark drafter, an FP8 KV cache, FP8 attention projections, Blackwell FP4/MXFP8 tensor-core prefill, vision, structured output and vLLM-style `reasoning_effort`. All of the TensorFold engineering here is hers and the TensorFold contributors'. This repo adds only the run settings we used and a head-to-head with the vLLM lanes. For DFlash2 inside TensorFold, see [TensorFold + DFlash2](#tensorfold--dflash2-our-patch-0018) below.
 
 ### Run it
 
@@ -475,6 +477,59 @@ Chart: [`results/inkling_vllm_vs_tensorfold_spark.png`](results/inkling_vllm_vs_
 - **Acceptance lengths are not like-for-like.** vLLM verifies a fixed 7-token draft each step. TensorFold drafts fewer tokens per step but accepts 60-89% of them.
 - **Text differs from vLLM.** 13 of 40 replies are byte-identical, because the recipe's defaults (fp8 KV, FP8 attention, tensor-core prefill) are lossy. Math answers were 5/5 equal and code, math and json scored 1.0 on all three. The recipe's own `exact.py` check, drafted vs `"draft": false` vs 6-way concurrent, passed on our box (508 and 498 drafts accepted).
 - Her 200K needle passed at `max_tokens=512`, finding the README's own passphrase. Cold prefill took 98 s.
+
+## TensorFold + DFlash2 (our patch 0018)
+
+Added 2026-11-24. TensorFold's Inkling 2 Mini CUDA engine ships the checkpoint's DSpark drafter (from Mia's patch 0002). Patch 0018 adds the [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) drafter as a second drafter behind the same interface. TensorFold's lane rounds and verify windows are unchanged, so the verify step keeps outputs exact. `--drafter <dir>` picks DFlash2 when that folder's `config.json` names `DFlash2DraftModel`, and DSpark otherwise, exactly as before.
+
+What 0018 adds:
+
+- `zig/src/families/inkling2/mini_dflash2.zig`: the drafter, covering config checks, weights, a per-stream 5-layer sliding context ring (~42 MiB a stream, vs ~1 GiB for DSpark's global layer at 262K), feature absorb from the target's taps (visits 5, 23, 41 and the final normed row), and the batched draft pass.
+- `zig/kernels/cuda/inkling2/dflash2.cu`: the 2-tap grouped dynamic conv, block attention over the sliding window plus the block, the top-16 over the 200,058 real tokens, and the selector's greedy walk.
+- Speed-ups, all on by default: FP8 drafter layers (`TF_INKLING2_DFLASH2_FP8`), a 4-bit copy of the output head used only for drafting (`TF_INKLING2_DFLASH2_HEAD4`; verification keeps the full-precision head, and the copy adds ~11 s at load), and acceptance-guided verification for single streams (`TF_INKLING2_DFLASH2_CHANCES`). The draft head's own calibrated probabilities decide how many drafted tokens each round verifies, because on this MoE target each extra verified token costs ~5 ms. With several streams this measured slower, so it switches off there.
+
+### Run it
+
+```bash
+git clone https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold
+cd Inkling-2-Mini-DGX-Spark-TensorFold                 # tested on commit 6061fa8 (TensorFold dc2ca8a1 + 0001-0017)
+cp <this repo>/tensorfold/patches/0018-mini-dflash2-drafter.patch patches/
+git apply <this repo>/tensorfold/recipe/recipe-drafter-dflash2.patch   # adds DRAFTER=dspark|dflash2 to start.sh/config.sh
+hf download incoai/Inkling-2-Mini-DFlash2 --local-dir ~/models/Inkling-2-Mini-DFlash2
+IMAGE=tensorfold-inkling2:dflash2 DRAFTER=dflash2 TENSORFOLD_MEMORY_RESERVE_GIB=14 ./start.sh
+```
+
+- Use a new `IMAGE` tag so `start.sh` builds a fresh image with 0018. An image you built earlier from the recipe does not contain it.
+- 0018 applies cleanly on `dc2ca8a1` plus 0001-0017. The engine binary we measured was built with the recipe Dockerfile's own zig command and flags, and run inside the recipe's image. We did not run the full `prepare.sh` image build with 0018 end to end. If that path breaks for you, open an issue.
+- `DRAFTER=dspark` (the default) serves exactly what the recipe serves today.
+
+### Results (one Spark, same bench, thinking off, temperature 0, the recipe's live settings: 262K x 8, fp8 KV)
+
+| | TensorFold DSpark | vLLM DFlash2 | **TensorFold DFlash2** |
+|---|---|---|---|
+| Decode, one user, mean of 8 prompt types | 68.2 tok/s | 88.2 tok/s | **105.5 tok/s** |
+| One user: code / math / json / html | 68.8 / 67.5 / 74.2 / 72.3 | 94.6 / 82.2 / 91.2 / 83.9 | **99.4 / 109.1 / 114.0 / 98.7** |
+| One user: prose / narrative / summary / counting | 57.7 / 52.7 / 61.3 / 90.9 | 73.0 / 71.8 / 77.0 / 131.7 | **90.8 / 91.9 / 88.2 / 152.2** |
+| Aggregate, mean of 8 types: c2 / c3 / c4 / c5 / c6 | 90 / 108 / 121 / 138 / 148 | **129 / 151 / 180 / 204 / 227** | 121 / 141 / 165 / 179 / 191 |
+| Tokens accepted per target step, one user | 1.8-3.4 | 4.1-6.7 | 3.3-6.4 |
+| TTFT c1 / c3 / c6 | 0.56 / 1.16 / 2.10 s | 0.67 / 3.62 / 3.50 s | **0.55 / 1.15 / 2.05 s** |
+| Prefill 1K / 8K / 31K | 2,460 / 3,354 / 3,127 | 2,077 / 2,825 / 2,713 | **2,485 / 3,395 / 3,162** tok/s |
+| 6-prompt decode bench | 54.7 tok/s | 55.2 tok/s | **70.2 tok/s** |
+
+All cells: [`results/tf_dflash2_spark.md`](results/tf_dflash2_spark.md). Chart: [`results/tf_dflash2_spark.png`](results/tf_dflash2_spark.png).
+
+Checks:
+
+- The recipe's `exact.py` passes at 512 tokens and at a 3K pad (prompts longer than the drafter's 2,048-token window). Drafted replies equal `"draft": false`, and concurrent equals serial ([`results/exact_v7_pad0.log`](results/exact_v7_pad0.log), [`exact_v7_pad3k.log`](results/exact_v7_pad3k.log)).
+- The sanity set is 8/8 byte-identical to the recipe's DSpark run. DSpark on the patched build gives the same token hashes as the recipe image.
+- Drafter numerics match an independent CPU reference of the same math as our vLLM port ([`tensorfold/tools/inkling2_dflash2_ref.py`](tensorfold/tools/inkling2_dflash2_ref.py)) on 8/8 recorded draft passes: identical drafts, and 15-16 of the top 16 candidates in common.
+- A 100K needle is found (give it `max_tokens` 512, because the model reasons first). Temperature 0.7 and 1.0 run with drafts.
+
+Limits:
+
+- Acceptance-guided verification helps one stream only. With several streams TensorFold's shared-round depth rule decides, and one cell (html at 2 users) fell back to near-plain rounds.
+- Sampled requests (temperature > 0) get greedy drafts. Output stays correct but acceptance is lower; DSpark's matched-noise drafting is not ported.
+- Text only was tested with this drafter. Images were not.
 
 ## 11. Troubleshooting
 
@@ -511,13 +566,15 @@ Chart: [`results/inkling_vllm_vs_tensorfold_spark.png`](results/inkling_vllm_vs_
 | `prepare_dflash2.sh` | copies 4 stock vLLM files out of the image, checks sha256, applies `dflash2/patches/*.diff` |
 | `dflash2/` | the 4 diffs, `SHA256SUMS`, vLLM's LICENSE (the patched `.py` files are generated here) |
 | `bench/` | the DSpark vs DFlash2 bench: `bench_inkling.py` (8 prompt types, c1 to c6), `bench_decode.py` (6-prompt single-stream decode), `compare_outputs.py`, `make_report.py`, `sanity.py` |
-| `results/` | the 69-scenario scorecards behind section 10, the DFlash2 bench JSON, tables and chart, and the vLLM vs TensorFold tables, JSON and chart |
+| `tensorfold/` | patch 0018 (DFlash2 in TensorFold's Inkling 2 Mini CUDA engine), the recipe patch (`DRAFTER=dflash2`), the numeric reference and bench/chart tools, TensorFold's Apache 2.0 LICENSE |
+| `results/` | the 69-scenario scorecards behind section 10, the DFlash2 bench JSON, tables and chart, the vLLM vs TensorFold tables, JSON and chart, and the TensorFold DFlash2 bench, checks and chart |
 
 ## Credits
 
 - [Thinking Machines Lab](https://huggingface.co/thinkingmachines) for Inkling 2 Mini, its NVFP4/MXFP8 checkpoint and the DSpark drafter ([model card](https://huggingface.co/thinkingmachines/Inkling-2-Mini), Apache 2.0).
 - The [vLLM](https://github.com/vllm-project/vllm) project for Inkling 2 support, the [`vllm/vllm-openai:inkling-2-mini`](https://hub.docker.com/r/vllm/vllm-openai/tags?name=inkling-2-mini) image and the [Inkling 2 Mini recipe](https://recipes.vllm.ai/thinkingmachines/Inkling-2-Mini) this one starts from.
 - NVIDIA for the DGX Spark platform.
+- **TensorFold + DFlash2 (patch 0018):** built on [Mia's AI Lab](https://x.com/MiaAI_lab) recipe and patches 0001-0017, reusing its DSpark drafter interface, tap features and helper kernels (0002). Jürgen Schmied's Inkling 2 Mini CUDA engine (TensorFold #4441), whose draft-tree acceptance calibration we reuse. Christian Schröder (cwschroeder), TensorFold #4917, the Metal DFlash2 drafter for Inkling, whose Inkling wiring, window geometry and attention design we ported to CUDA. BobClawblaw, TensorFold #979, GLM's CUDA DFlash2, whose conv and top-16 kernels we adapted, along with its idea of sizing drafts by their chances; later GLM DFlash2 work is by Ash Hart and others. Inco AI for the drafter, plus z-lab DFlash and vLLM as above. TensorFold is Apache 2.0 ([`tensorfold/LICENSE`](tensorfold/LICENSE)), and patch 0018 is offered under the same license.
 - **TensorFold lane:** [Mia's AI Lab](https://x.com/MiaAI_lab) for the Inkling 2 Mini TensorFold recipe ([MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold), Apache 2.0): the CUDA DSpark drafter, FP8 KV, tensor-core prefill, vision, structured output and the Docker build. [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart (ashhart) and contributors, with the Inkling 2 Mini CUDA engine by Jürgen Schmied (PR #4441).
 - [Inco AI](https://inco.ai) for the [Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) drafter (Apache 2.0) and its SGLang compatibility patch. We took no code from that patch, but three behaviors in our vLLM files follow it: Inkling's feature ids used as-is, the soft-cap after the selector correction, and the real-vocab limit (already in vLLM). Write-up: [DFlash 2](https://inco.ai/blog/dflash2/).
 - [z-lab DFlash](https://github.com/z-lab/dflash): Jian Chen, Yesheng Liang and Zhijian Liu, "DFlash: Block Diffusion for Flash Speculative Decoding" (ICML 2026).

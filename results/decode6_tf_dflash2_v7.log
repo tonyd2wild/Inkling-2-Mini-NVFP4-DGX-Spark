@@ -1,0 +1,8 @@
+  p1:  512 tok  ttft    148 ms  decode   91.1 tok/s  | '```python\nfrom datetime import date\nimport unittest\n\n\ndef weekday_name'
+  p2:  512 tok  ttft    137 ms  decode   61.5 tok/s  | 'A refrigerator doesn’t “make” cold. It moves heat. Heat naturally flow'
+  p3:  434 tok  ttft    134 ms  decode   57.5 tok/s  | '1. Use a simple inventory system to track sizes, colors, and stock lev'
+  p4:  430 tok  ttft    158 ms  decode   98.0 tok/s  | 'Assume both trains go the same direction on the same track.\n\n1. Time g'
+  p5:  512 tok  ttft    146 ms  decode   60.4 tok/s  | ''
+  p6:  512 tok  ttft    156 ms  decode   71.1 tok/s  | ''
+tf_dflash2_v7 aggregate decode 70.2 tok/s, median 71.1, total 2912 tok
+tokens 2912 drafted 4052 accepted 1883 rounds 1028: accept/draft 0.465, drafts/round 3.94, tokens/round 2.83
