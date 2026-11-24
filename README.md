@@ -1,8 +1,22 @@
-# Inkling 2 Mini (NVFP4) on one NVIDIA DGX Spark: vLLM, DSpark, up to 1M context
+# Inkling 2 Mini (NVFP4) on one NVIDIA DGX Spark: vLLM, DSpark or DFlash2, up to 1M context
 
 A tested recipe for serving [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on a single DGX Spark (GB10) with the official vLLM image, DSpark speculative decoding and three launch tiers: the vLLM recipe's 262K setup, and two 1,048,576-token (full 1M) setups, one with BF16 KV and one with FP8 KV.
 
 Unofficial community recipe. Not affiliated with Thinking Machines Lab, vLLM or NVIDIA. This repo has no weights.
+
+> **New (2026-11-24): DFlash2 drafter, about 1.4x faster decode.** `launch_dflash2.sh` runs the standard tier with the [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) drafter instead of DSpark, plus four small vLLM patches (`./prepare_dflash2.sh` builds them from the image). Same session, same prompts, temperature 0:
+>
+> | | DSpark k=7 (standard) | **DFlash2 k=7** |
+> |---|---|---|
+> | Decode, one user, mean of 8 prompt types | 61 tok/s | **88 tok/s** (1.44x) |
+> | Decode, one user: code / math / prose | 72 / 56 / 37 tok/s | **95 / 82 / 73** |
+> | Aggregate, 6 users | 162 tok/s | **227 tok/s** (1.40x) |
+> | Tokens accepted per step (6-prompt bench) | 2.40 | **3.26** |
+> | KV pool at util 0.80 | 1,345,297 tokens | **1,503,521 tokens** |
+> | Prefill, TTFT | 2.1K to 2.8K tok/s | unchanged |
+> | Output text at temperature 0 | | 48/48 identical to DSpark |
+>
+> Chart: [`results/inkling_dflash2_spark.png`](results/inkling_dflash2_spark.png). Details: [DFlash2 section](#dflash2-drafter-patch-results-caveats).
 
 Measured on one Spark on 2026-11-20 and 2026-11-21:
 
@@ -79,6 +93,8 @@ git clone https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark
 cd Inkling-2-Mini-NVFP4-DGX-Spark
 
 ./launch_standard.sh            # 262K context, util 0.80, BF16 KV
+./prepare_dflash2.sh && hf download incoai/Inkling-2-Mini-DFlash2 --local-dir ~/models/Inkling-2-Mini-DFlash2
+./launch_dflash2.sh             # standard tier with the DFlash2 drafter (~1.4x faster decode)
 ./launch_maxkv_fp8.sh           # 1M context, 74 GiB FP8 KV (the most context)
 ./launch_maxkv.sh               # 1M context, 80 GiB BF16 KV
 KV_GIB=76 ./launch_maxkv.sh     # step down 4 GiB if you want more OS headroom
@@ -332,6 +348,95 @@ The max BF16 tier uses the same weights and the same BF16 KV as the standard tie
 
 Apart from TC-22, the lost points are the same on both: four "hallucinated tools" partials (it never invented a tool, but did not clearly say what it could not do), error recovery (ignored a flight-search error, unclear handling of an empty result), refusals (it did not refuse one clearly malicious request, TC-58, and two refusals were unclear), one skipped tool call (TC-15), two ambiguity partials where it guessed instead of asking, and one chain that skipped the final comparison math.
 
+## DFlash2 drafter: patch, results, caveats
+
+Added 2026-11-24. `launch_dflash2.sh` is the standard tier (262K context, util 0.80, BF16 KV) with the [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) drafter in place of DSpark, and four patched vLLM files bind-mounted read-only over the image. Same container name and port as the other tiers.
+
+### What it is
+
+[`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) is an external DFlash 2
+drafter for Inkling 2 Mini (0.5B BF16, 990 MB, 5 sliding-window layers, block size 8). It drafts a whole block in one
+pass, keeps the top 16 candidates per position, and a low-rank selector picks one path through them. Its card only
+documents SGLang with FlashAttention 4 on an H200. This vLLM image already ships generic DFlash2 support
+(`DFlash2DraftModel`, `method: "dflash"`), but not the Inkling-specific parts: without them the drafter loads, taps
+the wrong target layers, embeds its inputs differently from training and soft-caps in the wrong place, so few drafts
+are accepted. Four patched vLLM files fix that. They are the same files as in the RTX 3090 repo; on GB10 the SM8x
+fallbacks in them are inactive (the image has sm_121 kernels for everything the drafter uses), so no extra flags.
+
+### The patch (4 files, bind-mounted read-only, `dflash2/`)
+
+`prepare_dflash2.sh` copies the 4 stock files out of the image, checks their sha256, applies `dflash2/patches/*.diff`
+(unified diffs, `a/vllm/...` → `b/vllm/...`) and checks the result against `dflash2/SHA256SUMS`. The arm64 image's
+stock files have the same sha256 as the x86 image's.
+
+| File (in-image path under `vllm/`) | Change | Why |
+|---|---|---|
+| `v1/worker/gpu/spec_decode/eagle/eagle3_utils.py` | For Inkling2 targets, use `dflash_config.target_layer_ids` as-is instead of adding 1. | Inkling2 names its feature taps as layer *visits* of the looped model: [5, 23, 41, 48], where 48 (= number of visits) is the post-final-norm state. DSpark already taps exactly these. vLLM's DFlash path added +1 (HF hidden-state convention), which would tap visits 6/24/42/49. inco's SGLang patch does the same thing (`resolve_dflash_capture_layers`). |
+| `model_executor/models/qwen3_dflash2.py` | (a) `selector_softcap_mode: "after_correction"`: unary logits stay raw, the final-logit soft-cap (30) is applied to unary + edge scores. (b) Draft inputs (bonus token + mask tokens) pass through the target's `embed_norm`. (c) Below SM90 only (not used on GB10): torch `SiluAndMul`. | (a) The drafter config asks for it; vLLM only knew soft-capping the unary logits, which changes which candidate wins. Ported from inco's SGLang patch. (b) Inkling embeds tokens as `embed_norm(embed_tokens(ids))` and the drafter is trained on that (SGLang's DFlash worker uses the target's `get_input_embeddings()`); vLLM shared only the raw table. |
+| `v1/worker/gpu/spec_decode/dflash2/speculator.py` | After loading the drafter, call its `attach_target(target_model)`. | Wires (b) above; does nothing for other targets. |
+| `model_executor/models/qwen3_dflash.py` | Below SM90 only (not used on GB10): torch RMSNorm/RoPE in the context K/V precompute. | For the RTX 3090 build, which lacks SM86 kernels. |
+
+Not needed in vLLM: inco's SGLang patch also limits the candidate projection to the 200,058 real tokens (201,024 is
+padded storage). vLLM's DFlash2 head already uses `min(target vocab, draft vocab)` = 200,058 here.
+
+### How to run
+
+```bash
+./prepare_dflash2.sh
+hf download incoai/Inkling-2-Mini-DFlash2 --local-dir ~/models/Inkling-2-Mini-DFlash2
+./launch_dflash2.sh          # k=7, 262,144 context, util 0.80, :18120 (NAME / PORT / RESTART overridable)
+```
+
+### Results
+
+Same scripts, same session, thinking off, temperature 0, nothing else on the endpoint. Bench: `bench/bench_inkling.py`
+(prompts and graders from our house toolkit, plus math and counting), 8 prompt types x 5 prompts, streamed, c1..c6.
+Chart: `results/inkling_dflash2_spark.png`, all numbers: `results/tables_spark.md`, raw: `results/bench_*.json`.
+Baseline = the standard profile's DSpark k=7.
+
+| | DSpark k=7 | DFlash2 k=7 | |
+|---|---|---|---|
+| 6-prompt decode bench (`bench_decode.py`) | 40.2 tok/s, 2.40 tokens/step | **55.2 tok/s, 3.26 tokens/step** | 1.37x |
+| Decode, one user: coding / math / json / html | 72 / 56 / 76 / 69 tok/s | **95 / 82 / 91 / 84** | 1.20-1.47x |
+| Decode, one user: prose / narrative / summary / counting | 37 / 37 / 53 / 93 tok/s | **73 / 72 / 77 / 132** | 1.42-1.96x |
+| Acceptance length c1: coding / math / json / html | 4.33 / 3.44 / 4.54 / 4.01 | **5.50 / 4.83 / 5.33 / 4.89** | |
+| Acceptance length c1: prose / narrative / summary / counting | 2.19 / 2.25 / 3.19 / 5.19 | **4.37 / 4.08 / 4.68 / 6.71** | |
+| Aggregate tok/s, mean of 8 types: c1 / c2 / c3 / c4 / c5 / c6 | 61 / 92 / 104 / 125 / 144 / 162 | **88 / 129 / 151 / 180 / 204 / 227** | 1.39-1.45x |
+| TTFT c1 / c6, ~1.68K-token fresh prompt | 607 / 3,008 ms | 665 / 3,495 ms | about the same (c3+ is prefill-bound and noisy) |
+| Prefill 1K / 8K / 31K | 2,086 / 2,802 / 2,729 tok/s | 2,077 / 2,825 / 2,713 tok/s | same |
+| Auto-graded quality, c1 (8 types) | | identical scores | |
+| Output text, temperature 0 (40 bench + 8 sanity prompts) | | **48/48 byte-identical** to DSpark | |
+| KV pool at util 0.80 | 1,345,297 tokens (5.13x at 262K) | **1,503,521 tokens (5.74x)** | +158K |
+| MemAvailable after warmup | 18.9 GiB | 19.9 GiB | |
+
+Per-position acceptance (c1). Prose, positions 0-6: DSpark 0.57 / 0.29 / 0.14 / 0.08 / 0.05 / 0.04 / 0.02, DFlash2
+0.79 / 0.61 / 0.49 / 0.42 / 0.38 / 0.35 / 0.33. Coding: DSpark 0.81 → 0.28, DFlash2 0.90 → 0.47.
+
+KV pool: it grows because all 5 DFlash2 draft layers are sliding-window (2048 tokens), while the DSpark draft has a
+full-attention layer that keeps KV for every token. The drafter weights (~1 GB) fit inside the same util budget.
+
+Other checks on the live lane: tool call returned (`get_weather`, correct arguments), temperature 0.7 sampling works,
+100K-token needle PASS (prefill 2,243 tok/s, 45.3 tok/s decode after it).
+
+Width: k=7 (the drafter's trained block of 8) was used on the Spark. On the RTX 3090s k=5 and k=3 were slower than
+k=7 at one user (156.5 and 150.4 vs 179.8 tok/s).
+
+### Caveats
+
+- Five prompts per type, one round per concurrency level: single cells are noisy.
+- Inkling writes a short reasoning block even with `reasoning_effort: none`. TTFT and decode count the first streamed
+  token of either kind. With max_tokens 1024 some prose/narrative/counting answers are cut off for both configs, which
+  is why those quality scores are low.
+- Byte-identical outputs are not guaranteed in general: speculative decoding verifies every token, but different
+  verify shapes can flip a near-tie.
+- The DSpark baseline keeps the profile's `draft_sample_method: probabilistic`; at temperature 0 both configs sample
+  greedily. Temperature > 0 with DFlash2 uses vLLM's candidate-walk sampling with rejection; smoke-tested only.
+- Text only was benchmarked; images were not tested with the drafter.
+- Tested with the BF16-KV standard profile. The FP8-KV max tiers were not run with the drafter (DFlash drafters want
+  BF16 KV; vLLM can keep the draft cache in BF16 via `"kv_cache_dtype": "auto"` in the speculative config, untested).
+- Concurrency was measured to c6 only. inco's H200 numbers show the DFlash2 gain shrinking at large batch.
+
+
 ## 11. Troubleshooting
 
 | Symptom | Fix |
@@ -348,6 +453,8 @@ Apart from TC-22, the lost points are the same on both: four "hallucinated tools
 | `content` is empty but tokens were used | The model spent `max_tokens` thinking. Raise `max_tokens` or lower the effort. |
 | Low acceptance or slow decode in a benchmark | Use realistic text, not random tokens. Check that `mtp.safetensors` exists and the log shows `SpeculativeConfig(method='dspark' ...)`. |
 | Allocation fails right after a large download or copy | GB10 page-cache trap: `sync; echo 1 \| sudo tee /proc/sys/vm/drop_caches`, then relaunch. The max-KV launchers do this once automatically (needs passwordless sudo, skipped otherwise). |
+| `prepare_dflash2.sh` says the image's files differ | The patches are made against vLLM `0.1.dev25855+g7cb5dae22` (`vllm/vllm-openai:inkling-2-mini`, digest in the launchers). Pull that image, or re-make the diffs against yours. |
+| DFlash2 runs but accepts few tokens (around 2 per step) | The drafter is tapping the wrong layers or the patched files are not mounted. Check `docker inspect` shows the 4 `dflash2/*.py` mounts and the log shows `method='dflash'`. |
 | Want to silence the 0.80 warning | Leave it. Using 1.0 on unified memory starves the OS. |
 | Long prompts time out in the client | Prefill is the slow part and slows down with length: about 2 minutes for 200K and 26.5 minutes for 950K (section 9). Set client timeouts of 30+ minutes for near-1M prompts. |
 
@@ -361,15 +468,25 @@ Apart from TC-22, the lost points are the same on both: four "hallucinated tools
 | `stop.sh` | stops and removes the container (any tier) |
 | `watch_start.sh` | logs MemAvailable every 5 s during startup, kills the container under 3 GiB |
 | `sanity.py` | light checks: 2 chats, and a needle at any length |
-| `results/` | the 69-scenario scorecards behind section 10 |
+| `launch_dflash2.sh` | standard tier with the DFlash2 drafter (k=7) |
+| `prepare_dflash2.sh` | copies 4 stock vLLM files out of the image, checks sha256, applies `dflash2/patches/*.diff` |
+| `dflash2/` | the 4 diffs, `SHA256SUMS`, vLLM's LICENSE (the patched `.py` files are generated here) |
+| `bench/` | the DSpark vs DFlash2 bench: `bench_inkling.py` (8 prompt types, c1 to c6), `bench_decode.py` (6-prompt single-stream decode), `compare_outputs.py`, `make_report.py`, `sanity.py` |
+| `results/` | the 69-scenario scorecards behind section 10, and the DFlash2 bench JSON, tables and chart |
 
 ## Credits
 
 - [Thinking Machines Lab](https://huggingface.co/thinkingmachines) for Inkling 2 Mini, its NVFP4/MXFP8 checkpoint and the DSpark drafter ([model card](https://huggingface.co/thinkingmachines/Inkling-2-Mini), Apache 2.0).
 - The [vLLM](https://github.com/vllm-project/vllm) project for Inkling 2 support, the [`vllm/vllm-openai:inkling-2-mini`](https://hub.docker.com/r/vllm/vllm-openai/tags?name=inkling-2-mini) image and the [Inkling 2 Mini recipe](https://recipes.vllm.ai/thinkingmachines/Inkling-2-Mini) this one starts from.
 - NVIDIA for the DGX Spark platform.
+- [Inco AI](https://inco.ai) for the [Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) drafter (Apache 2.0) and its SGLang compatibility patch. We took no code from that patch, but three behaviors in our vLLM files follow it: Inkling's feature ids used as-is, the soft-cap after the selector correction, and the real-vocab limit (already in vLLM). Write-up: [DFlash 2](https://inco.ai/blog/dflash2/).
+- [z-lab DFlash](https://github.com/z-lab/dflash): Jian Chen, Yesheng Liang and Zhijian Liu, "DFlash: Block Diffusion for Flash Speculative Decoding" (ICML 2026).
+- The [vLLM](https://github.com/vllm-project/vllm) DFlash / DFlash2 speculators and draft models we patch (Apache 2.0, license kept in `dflash2/LICENSE`). vLLM's DFlash2 grouped-convolution kernel credits LightSeek TokenSpeed PR #1399 in its source.
+- The [SGLang](https://github.com/sgl-project/sglang) project: we read its Inkling 2 model and DFlash worker to confirm how Inkling embeds draft inputs. No code taken.
+- [club-3090](https://github.com/noonghunna/club-3090) (noonghunna) and syv-ai's [vLLM DFlash2 backport](https://github.com/syv-ai/qwen38-27b-rtx3090), read as a reference for serving an external DFlash2 drafter in vLLM. No code taken.
+- Bench prompts, graders and chart style come from our own toolkit in [GLM-5.3-Flash-EXL3-on-2x-NVIDIA-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-EXL3-on-2x-NVIDIA-DGX-Spark) (`tools/`).
 - The 69-scenario tool eval ([2Wild-Model-Eval](https://github.com/tonyd2wild/2Wild-Model-Eval)) follows the Pass/Partial/Fail method of wolttam's `tool-eval-bench`.
 
 ## License
 
-The scripts and docs in this repository are MIT ([LICENSE](LICENSE)). The model weights are not included. Inkling 2 Mini is Apache 2.0 from Thinking Machines Lab, and vLLM is Apache 2.0.
+The scripts and docs in this repository are MIT ([LICENSE](LICENSE)). The model weights are not included. Inkling 2 Mini is Apache 2.0 from Thinking Machines Lab, and vLLM is Apache 2.0. The files generated in `dflash2/` and the diffs in `dflash2/patches/` are derived from vLLM source and stay Apache 2.0 (`dflash2/LICENSE`). The DFlash2 drafter is Apache 2.0 from Inco AI.

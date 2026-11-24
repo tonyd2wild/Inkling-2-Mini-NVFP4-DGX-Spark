@@ -1,0 +1,8 @@
+  p1:  512 tok  ttft    170 ms  decode   62.4 tok/s  | '```python\nfrom datetime import date, datetime\n\n\ndef weekday_name(iso_d'
+  p2:  512 tok  ttft    169 ms  decode   45.2 tok/s  | 'A refrigerator is like a tiny heat pump. It does not “create” cold by '
+  p3:  512 tok  ttft    218 ms  decode   51.2 tok/s  | '1. Group sneakers by brand, size, and color so customers and staff can'
+  p4:  458 tok  ttft    178 ms  decode   76.8 tok/s  | 'Assume both trains move in the same direction at constant speeds.\n\n- F'
+  p5:  512 tok  ttft    227 ms  decode   43.9 tok/s  | 'The TrailGuard Pro is built for hikers who want reliable footing when '
+  p6:  512 tok  ttft    238 ms  decode   67.3 tok/s  | ''
+spark_dflash2_k7 aggregate decode 55.2 tok/s, median 62.4, total 3018 tok
+spark_dflash2_k7 spec: drafts 932, draft tokens 6524, accepted 2102 -> acceptance 32.2%, mean accepted/draft 2.26 (tokens per target step 3.26)
