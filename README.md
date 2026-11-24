@@ -1,4 +1,4 @@
-# Inkling 2 Mini (NVFP4) on one NVIDIA DGX Spark: vLLM, DSpark or DFlash2, up to 1M context
+# Inkling 2 Mini (NVFP4) on one NVIDIA DGX Spark: vLLM (DSpark or DFlash2) and TensorFold, up to 1M context
 
 A tested recipe for serving [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on a single DGX Spark (GB10) with the official vLLM image, DSpark speculative decoding and three launch tiers: the vLLM recipe's 262K setup, and two 1,048,576-token (full 1M) setups, one with BF16 KV and one with FP8 KV.
 
@@ -17,6 +17,8 @@ Unofficial community recipe. Not affiliated with Thinking Machines Lab, vLLM or 
 > | Output text at temperature 0 | | 48/48 identical to DSpark |
 >
 > Chart: [`results/inkling_dflash2_spark.png`](results/inkling_dflash2_spark.png). Details: [DFlash2 section](#dflash2-drafter-patch-results-caveats).
+
+> **Also measured (2026-11-24): a TensorFold lane**, using [Mia's AI Lab TensorFold recipe](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold) through the same bench. TensorFold is ahead on prefill (14-24% faster) and time to first token (1.2 s vs 3.6 s at 3 users). vLLM + DFlash2 is ahead on decode (88 vs 68 tok/s for one user, 227 vs 148 at 6 users). Details: [TensorFold lane](#tensorfold-lane-mias-ai-lab-recipe), chart: [`results/inkling_vllm_vs_tensorfold_spark.png`](results/inkling_vllm_vs_tensorfold_spark.png).
 
 Measured on one Spark on 2026-11-20 and 2026-11-21:
 
@@ -437,6 +439,43 @@ k=7 at one user (156.5 and 150.4 vs 179.8 tok/s).
 - Concurrency was measured to c6 only. inco's H200 numbers show the DFlash2 gain shrinking at large batch.
 
 
+## TensorFold lane (Mia's AI Lab recipe)
+
+Added 2026-11-24. The same model on [TensorFold](https://github.com/ashhart/TensorFold), with Jürgen Schmied's Inkling 2 Mini CUDA engine ([PR #4441](https://github.com/ashhart/TensorFold/pull/4441)) and the 17 patches of **[MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold)** (Apache 2.0). Her patches add the CUDA DSpark drafter, an FP8 KV cache, FP8 attention projections, Blackwell FP4/MXFP8 tensor-core prefill, vision, structured output and vLLM-style `reasoning_effort`. All of the TensorFold engineering here is hers and the TensorFold contributors'. This repo adds only the run settings we used and a head-to-head with the vLLM lanes. TensorFold's CUDA engine does not run the DFlash2 drafter yet.
+
+### Run it
+
+```bash
+git clone https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold
+cd Inkling-2-Mini-DGX-Spark-TensorFold        # we tested commit 6061fa8
+TENSORFOLD_MEMORY_RESERVE_GIB=14 ./start.sh --alias inkling-2-mini-nvfp4 --alias inkling-2-mini
+```
+
+- Her defaults: port 8888, 262,144 context x 8 streams, fp8 KV, DSpark, vision. Her `fetch.sh` downloads and SHA-256 checks a pinned revision of the official checkpoint (the same weights as the vLLM lanes).
+- We raised `TENSORFOLD_MEMORY_RESERVE_GIB` from 9 to 14. That only shrinks the prompt cache and keeps more headroom for the OS: the engine took 59.7 GiB plus a 20.3 GiB prompt cache, with about 27 GiB of MemAvailable left.
+- Stop the vLLM container first. Only one Inkling engine fits in memory at a time.
+- The first run builds a ~24.5 GB Docker image (most of it NVIDIA's PyTorch base). To switch back to vLLM without deleting her container, use `docker stop inkling2-mini-tf`. Her `stop.sh` removes the container.
+
+### Results (one Spark, same bench, thinking off, temperature 0)
+
+| | vLLM DSpark | vLLM DFlash2 | **TensorFold DSpark** |
+|---|---|---|---|
+| Decode, one user, mean of 8 prompt types | 61 tok/s | **88 tok/s** | 68 tok/s |
+| Decode, one user: code / math / json / html | 72 / 56 / 76 / 69 | **95 / 82 / 91 / 84** | 69 / 68 / 74 / 72 |
+| Decode, one user: prose / narrative / summary / counting | 37 / 37 / 53 / 93 | **73 / 72 / 77 / 132** | 58 / 53 / 61 / 91 |
+| Aggregate, mean of 8 types: c1 / c2 / c3 / c4 / c5 / c6 | 61 / 92 / 104 / 125 / 144 / 162 | **88 / 129 / 151 / 180 / 204 / 227** | 68 / 90 / 108 / 120 / 137 / 148 |
+| TTFT, ~1.68K-token fresh prompt: c1 / c3 / c6 | 0.61 / 3.60 / 3.01 s | 0.67 / 3.62 / 3.50 s | **0.56 / 1.16 / 2.10 s** |
+| Prefill 1K / 8K / 31K | 2,086 / 2,802 / 2,729 tok/s | 2,077 / 2,825 / 2,713 tok/s | **2,460 / 3,354 / 3,127 tok/s** |
+| Auto-graded quality, c1 (mean of 8 types) | 0.764 | 0.764 | 0.785 |
+| Same prompt token counts as vLLM | | | 40/40 |
+
+Chart: [`results/inkling_vllm_vs_tensorfold_spark.png`](results/inkling_vllm_vs_tensorfold_spark.png). All cells, plus a reproduction of the recipe's own numbers: [`results/inkling_vllm_vs_tensorfold_spark.md`](results/inkling_vllm_vs_tensorfold_spark.md).
+
+- **Which lane:** TensorFold for long prompts and the fastest first token under load. vLLM + DFlash2 for the fastest replies.
+- **Acceptance lengths are not like-for-like.** vLLM verifies a fixed 7-token draft each step. TensorFold drafts fewer tokens per step but accepts 60-89% of them.
+- **Text differs from vLLM.** 13 of 40 replies are byte-identical, because the recipe's defaults (fp8 KV, FP8 attention, tensor-core prefill) are lossy. Math answers were 5/5 equal and code, math and json scored 1.0 on all three. The recipe's own `exact.py` check, drafted vs `"draft": false` vs 6-way concurrent, passed on our box (508 and 498 drafts accepted).
+- Her 200K needle passed at `max_tokens=512`, finding the README's own passphrase. Cold prefill took 98 s.
+
 ## 11. Troubleshooting
 
 | Symptom | Fix |
@@ -472,13 +511,14 @@ k=7 at one user (156.5 and 150.4 vs 179.8 tok/s).
 | `prepare_dflash2.sh` | copies 4 stock vLLM files out of the image, checks sha256, applies `dflash2/patches/*.diff` |
 | `dflash2/` | the 4 diffs, `SHA256SUMS`, vLLM's LICENSE (the patched `.py` files are generated here) |
 | `bench/` | the DSpark vs DFlash2 bench: `bench_inkling.py` (8 prompt types, c1 to c6), `bench_decode.py` (6-prompt single-stream decode), `compare_outputs.py`, `make_report.py`, `sanity.py` |
-| `results/` | the 69-scenario scorecards behind section 10, and the DFlash2 bench JSON, tables and chart |
+| `results/` | the 69-scenario scorecards behind section 10, the DFlash2 bench JSON, tables and chart, and the vLLM vs TensorFold tables, JSON and chart |
 
 ## Credits
 
 - [Thinking Machines Lab](https://huggingface.co/thinkingmachines) for Inkling 2 Mini, its NVFP4/MXFP8 checkpoint and the DSpark drafter ([model card](https://huggingface.co/thinkingmachines/Inkling-2-Mini), Apache 2.0).
 - The [vLLM](https://github.com/vllm-project/vllm) project for Inkling 2 support, the [`vllm/vllm-openai:inkling-2-mini`](https://hub.docker.com/r/vllm/vllm-openai/tags?name=inkling-2-mini) image and the [Inkling 2 Mini recipe](https://recipes.vllm.ai/thinkingmachines/Inkling-2-Mini) this one starts from.
 - NVIDIA for the DGX Spark platform.
+- **TensorFold lane:** [Mia's AI Lab](https://x.com/MiaAI_lab) for the Inkling 2 Mini TensorFold recipe ([MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold), Apache 2.0): the CUDA DSpark drafter, FP8 KV, tensor-core prefill, vision, structured output and the Docker build. [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart (ashhart) and contributors, with the Inkling 2 Mini CUDA engine by Jürgen Schmied (PR #4441).
 - [Inco AI](https://inco.ai) for the [Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) drafter (Apache 2.0) and its SGLang compatibility patch. We took no code from that patch, but three behaviors in our vLLM files follow it: Inkling's feature ids used as-is, the soft-cap after the selector correction, and the real-vocab limit (already in vLLM). Write-up: [DFlash 2](https://inco.ai/blog/dflash2/).
 - [z-lab DFlash](https://github.com/z-lab/dflash): Jian Chen, Yesheng Liang and Zhijian Liu, "DFlash: Block Diffusion for Flash Speculative Decoding" (ICML 2026).
 - The [vLLM](https://github.com/vllm-project/vllm) DFlash / DFlash2 speculators and draft models we patch (Apache 2.0, license kept in `dflash2/LICENSE`). vLLM's DFlash2 grouped-convolution kernel credits LightSeek TokenSpeed PR #1399 in its source.
